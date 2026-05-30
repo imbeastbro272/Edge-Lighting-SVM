@@ -47,10 +47,13 @@
                                       // this from the model output, treat the
                                       // user's pot value as a manual override.
 
-// PWM (ESP32 LEDC)
-#define LED_PWM_CHANNEL      0
-#define LED_PWM_FREQ_HZ      5000
-#define LED_PWM_RES_BITS     8        // 0..255
+// PWM
+// We use plain analogWrite() to stay compatible with both ESP32 Arduino
+// Core 2.x and 3.x (the 3.x release renamed ledcSetup / ledcAttachPin to
+// ledcAttach, which broke the old API). analogWrite() on ESP32 wraps LEDC
+// internally and is also what DT.ino uses, so the two sketches behave the
+// same way at the pin.
+#define LED_PWM_RANGE        255      // analogWrite() default duty range
 
 // LDR -> lux conversion. Tune for your divider; the same constant must be
 // used when training (i.e. the CSV's ambient_light_lux column should be the
@@ -109,11 +112,9 @@ void setup() {
     Serial.print  (F(" SVM_MAX_LUX    : ")); Serial.println(SVM_MAX_LUX, 2);
 
     pinMode(PIR_PIN, INPUT);
+    pinMode(LED_PIN, OUTPUT);
     pinMode(LDR_PIN, INPUT);
     pinMode(POT_PIN, INPUT);
-
-    ledcSetup(LED_PWM_CHANNEL, LED_PWM_FREQ_HZ, LED_PWM_RES_BITS);
-    ledcAttachPin(LED_PIN, LED_PWM_CHANNEL);
 
     Wire.begin();
     if (rtc.begin()) {
@@ -169,7 +170,7 @@ void loop() {
         pwm_value = pot_pwm;   // honour the human
     }
 
-    ledcWrite(LED_PWM_CHANNEL, pwm_value);
+    analogWrite(LED_PIN, pwm_value);
 
     // ---- Telemetry ----
     Serial.print(F("h=")); Serial.print(hour);
