@@ -1,22 +1,18 @@
 /*
  * utility_agent.h  -  Classical Utility-Based Agent (NON-ML AI layer)
  *
- * PURPOSE
- *   A small, self-contained decision layer that sits ON TOP of the existing
- *   SVM + KNN brightness pipeline. It performs constrained utility
- *   maximization to recommend an LED brightness, balancing three competing
- *   goals (comfort, energy, smoothness) while GUARANTEEING a safety floor at
- *   night when motion is present.
+ * Shared by RF_AI.ino and SVM.ino. This is the SAME agent regardless of which
+ * frozen base model (Random Forest / SVR / Decision Tree) produced the ML
+ * brightness - the agent only consumes that value as a comfort anchor.
  *
- *   This header is intentionally:
- *     - PURE C++  : no Arduino.h, no Serial, no EEPROM, no globals.
- *                   It can be unit-tested on a host PC with plain g++.
- *     - READ-ONLY : utility_evaluate() takes inputs by value and writes only
- *                   to the caller-provided UtilityResult. It NEVER touches the
- *                   prediction pipeline, the model header, or persistent state.
- *     - ADVISORY  : it only computes a recommendation. Whether that
- *                   recommendation actually drives the LED is decided by the
- *                   caller (the .ino sketch) via its own `util_apply` flag.
+ * DESIGN
+ *   - Config lives in RAM as a single global (g_util_cfg). It does NOT touch
+ *     the EEPROM layout used by the base-model + KNN pipeline.
+ *   - utilityAgentEvaluate() is READ-ONLY w.r.t. the prediction pipeline: it
+ *     takes the ML brightness, the previous applied brightness, and the raw
+ *     sensor/clock inputs, and writes only to the caller-provided result.
+ *   - ADVISORY by default: the .ino keeps a `util_apply` flag and only lets
+ *     the recommendation drive the LED when the user types "utilon".
  *
  * OBJECTIVE  (maximize)
  *     U(b) = w_comfort*Comfort(b) - w_energy*Energy(b) - w_smooth*Smooth(b)
@@ -25,25 +21,36 @@
  *       Smooth(b)  = ((b - prev_brightness)/100)^2
  *
  * HARD CONSTRAINT  (guaranteed, applied before the argmax search)
- *     if (is_night && motion)  =>  b >= min_safe_night   // default 40%
+ *     if (night AND motion)  =>  b >= min_safe_night     // default 40%
+ *     night := hour in [20:00, 04:00)
  *
  * DECISION
- *     argmax over b in {0, 5, 10, ..., 100}.
- *     Ties are broken toward the LOWER brightness (favours energy saving).
+ *     argmax over b in {0, 5, 10, ..., 100}; ties -> lower b (energy saving).
  */
 
 #ifndef UTILITY_AGENT_H
 #define UTILITY_AGENT_H
 
-// ---------------------------------------------------------------------------
-// Search grid for the brightness candidate b.
-// ---------------------------------------------------------------------------
+#if defined(ARDUINO)
+  #include <Arduino.h>
+#endif
+
+// --- Search grid for the brightness candidate b ----------------------------
 #define UTIL_B_MIN     0
 #define UTIL_B_MAX     100
 #define UTIL_B_STEP    5
 
+// --- Night window for the hard safety constraint (20:00 .. 03:59) -----------
+#ifndef UTIL_NIGHT_START_HOUR
+#define UTIL_NIGHT_START_HOUR  20
+#endif
+#ifndef UTIL_NIGHT_END_HOUR
+#define UTIL_NIGHT_END_HOUR    4
+#endif
+
 // ---------------------------------------------------------------------------
-// Configuration (lives in RAM on the caller side; defaults below).
+// Configuration (RAM only). Defaults: comfort-led, mild energy/smoothness
+// penalties, 40% night-motion safety floor.
 //   w_comfort / w_energy / w_smooth : objective weights (all >= 0)
 //   min_safe_night                  : guaranteed floor (%) when night+motion
 // ---------------------------------------------------------------------------
@@ -51,154 +58,202 @@ struct UtilityConfig {
   float w_comfort;
   float w_energy;
   float w_smooth;
-  float min_safe_night;
+  int   min_safe_night;
 };
 
+// Single global config instance, mutated by the `setutil` serial command.
+static UtilityConfig g_util_cfg = { 1.0f, 0.3f, 0.5f, 40 };
+
 // ---------------------------------------------------------------------------
-// Full breakdown of a single evaluation, filled in by utility_evaluate().
-// All term fields are the WEIGHTED contributions evaluated at `recommended`,
-// so utility == comfort_term - energy_term - smooth_term exactly.
+// Full breakdown of one evaluation. First member is a bool so the sketch can
+// brace-initialize with `UtilityResult g_util_result = { false };`.
+// The *_term fields are the WEIGHTED contributions at `recommended`, so
+//   utility == comfort_term - energy_term - smooth_term  (exactly).
 // ---------------------------------------------------------------------------
 struct UtilityResult {
+  bool  valid;             // has an evaluation been run yet?
+  float ml_anchor;         // ML brightness used as the comfort anchor
+  float prev_brightness;   // previous applied brightness (smoothness anchor)
+  float ambient;           // ambient lux at evaluation (for the printout)
+  int   motion;            // motion flag (0/1) at evaluation
+  int   hour;              // hour-of-day at evaluation
+  bool  is_night;          // derived: hour in night window
   float recommended;       // chosen brightness b* (%)
-  float ml_anchor;         // ml_prediction that was passed in (comfort anchor)
-  float prev_brightness;   // prev_brightness that was passed in
-  float comfort_raw;       // Comfort(b*)            (unweighted)
-  float energy_raw;        // Energy(b*)             (unweighted)
-  float smooth_raw;        // Smooth(b*)             (unweighted)
+  float comfort_raw;       // Comfort(b*)  (unweighted)
+  float energy_raw;        // Energy(b*)   (unweighted)
+  float smooth_raw;        // Smooth(b*)   (unweighted)
   float comfort_term;      // +w_comfort*Comfort(b*)
-  float energy_term;       //  w_energy *Energy(b*)  (subtracted in utility)
-  float smooth_term;       //  w_smooth *Smooth(b*)  (subtracted in utility)
+  float energy_term;       //  w_energy *Energy(b*)
+  float smooth_term;       //  w_smooth *Smooth(b*)
   float utility;           // U(b*)
-  bool  is_night;          // night flag that was passed in
-  bool  motion;            // motion flag that was passed in
-  bool  floor_active;      // true if the night+motion floor was in force
-  float floor_value;       // the floor (%) that was applied (cfg.min_safe_night)
-  bool  floor_binding;     // true if the floor actually raised the choice
-                           // (i.e. the unconstrained argmax was below floor)
+  bool  floor_active;      // night && motion (constraint in force)
+  bool  floor_binding;     // floor actually raised the choice
+  int   floor_value;       // the floor (%) applied
 };
 
-// ---------------------------------------------------------------------------
-// Sensible defaults (confirmed): comfort-led, mild energy/smoothness penalties,
-// 40% night-motion safety floor.
-// ---------------------------------------------------------------------------
-static inline UtilityConfig utility_default_config() {
-  UtilityConfig c;
-  c.w_comfort      = 1.0f;
-  c.w_energy       = 0.3f;
-  c.w_smooth       = 0.5f;
-  c.min_safe_night = 40.0f;
-  return c;
+// --- Night test -------------------------------------------------------------
+static inline bool utilityIsNight(int hour) {
+  return (hour >= UTIL_NIGHT_START_HOUR) || (hour < UTIL_NIGHT_END_HOUR);
 }
 
-// ---------------------------------------------------------------------------
-// Per-term helpers (unweighted). Kept tiny and branch-free.
-// ---------------------------------------------------------------------------
-static inline float utility_comfort(float b, float ml_prediction) {
-  float d = (b - ml_prediction) / 100.0f;
+// --- Per-term helpers (unweighted) -----------------------------------------
+static inline float utilityComfort(float b, float ml) {
+  float d = (b - ml) / 100.0f;
   return 1.0f - d * d;
 }
-static inline float utility_energy(float b) {
+static inline float utilityEnergy(float b) {
   return b / 100.0f;
 }
-static inline float utility_smooth(float b, float prev_brightness) {
-  float d = (b - prev_brightness) / 100.0f;
+static inline float utilitySmooth(float b, float prev) {
+  float d = (b - prev) / 100.0f;
   return d * d;
 }
 
 // ---------------------------------------------------------------------------
-// utility_evaluate()
+// utilityAgentEvaluate()
 //   Constrained argmax of U(b) over the discrete grid.
 //
 //   INPUTS (all read-only):
-//     cfg             - weights + night floor
-//     ml_prediction   - the existing SVM+KNN brightness (comfort anchor)
-//     prev_brightness - the brightness from the previous cycle (smoothness)
-//     is_night        - caller-computed night flag
-//     motion          - caller-computed motion flag (PIR)
+//     ml_prediction   - existing base-model + KNN brightness (comfort anchor)
+//     prev_brightness - the brightness applied on the previous cycle
+//     ambient         - ambient lux (stored for the printout; not in U)
+//     motion          - PIR motion flag (0/1)
+//     hour            - hour-of-day (0..23); night is derived from this
 //   OUTPUT:
-//     out             - optional; if non-null, filled with the full breakdown
+//     out             - optional; filled with the full breakdown if non-null
 //   RETURNS:
 //     the recommended brightness b* (%). The caller decides whether to use it.
 //
-//   This function allocates nothing and has no side effects beyond *out.
+//   Allocates nothing; has no side effects beyond *out.
 // ---------------------------------------------------------------------------
-static inline float utility_evaluate(const UtilityConfig &cfg,
-                                     float ml_prediction,
-                                     float prev_brightness,
-                                     bool  is_night,
-                                     bool  motion,
-                                     UtilityResult *out) {
-  // Hard constraint: restrict the feasible domain BEFORE searching.
-  bool  floor_active = (is_night && motion);
-  float floor_value  = cfg.min_safe_night;
+static inline float utilityAgentEvaluate(float ml_prediction,
+                                         float prev_brightness,
+                                         float ambient,
+                                         int   motion,
+                                         int   hour,
+                                         UtilityResult *out) {
+  bool  is_night       = utilityIsNight(hour);
+  bool  motion_present = (motion != 0);
+  bool  floor_active   = is_night && motion_present;
+  float floor_value    = (float)g_util_cfg.min_safe_night;
 
-  // --- Unconstrained argmax (for floor_binding diagnostics) ---
-  float best_b_unc   = (float)UTIL_B_MIN;
-  float best_u_unc   = -1e30f;
+  // Unconstrained optimum (for floor_binding diagnostics).
+  float best_b_unc = (float)UTIL_B_MIN;
+  float best_u_unc = -1e30f;
 
-  // --- Constrained argmax (the actual decision) ---
-  float best_b       = -1.0f;
-  float best_u       = -1e30f;
+  // Constrained optimum (the actual decision).
+  float best_b = -1.0f;
+  float best_u = -1e30f;
 
   for (int bi = UTIL_B_MIN; bi <= UTIL_B_MAX; bi += UTIL_B_STEP) {
     float b = (float)bi;
 
-    float comfort = utility_comfort(b, ml_prediction);
-    float energy  = utility_energy(b);
-    float smooth  = utility_smooth(b, prev_brightness);
+    float comfort = utilityComfort(b, ml_prediction);
+    float energy  = utilityEnergy(b);
+    float smooth  = utilitySmooth(b, prev_brightness);
 
-    float u = cfg.w_comfort * comfort
-            - cfg.w_energy  * energy
-            - cfg.w_smooth  * smooth;
+    float u = g_util_cfg.w_comfort * comfort
+            - g_util_cfg.w_energy  * energy
+            - g_util_cfg.w_smooth  * smooth;
 
-    // Track the unconstrained optimum (tie -> lower b, since we use '>').
-    if (u > best_u_unc) {
-      best_u_unc = u;
-      best_b_unc = b;
-    }
+    if (u > best_u_unc) { best_u_unc = u; best_b_unc = b; }
 
-    // Feasibility check for the constrained optimum.
-    if (floor_active && b < floor_value) {
-      continue;  // infeasible: below the guaranteed night-motion floor
-    }
+    // Feasibility: enforce the night+motion floor BEFORE selecting.
+    if (floor_active && b < floor_value) continue;
 
-    if (u > best_u) {
-      best_u = u;
-      best_b = b;
-    }
+    if (u > best_u) { best_u = u; best_b = b; }
   }
 
-  // Safety net: if the floor sits between grid points (e.g. floor=42 with a
-  // step of 5) no candidate may satisfy b >= floor exactly. In that case we
-  // clamp the recommendation up to the floor to keep the guarantee absolute.
-  if (floor_active && (best_b < floor_value)) {
+  // Safety net for floors that fall between grid points (e.g. 42 with step 5).
+  if (floor_active && best_b < floor_value) {
     best_b = floor_value;
     if (best_b > (float)UTIL_B_MAX) best_b = (float)UTIL_B_MAX;
-    best_u = cfg.w_comfort * utility_comfort(best_b, ml_prediction)
-           - cfg.w_energy  * utility_energy(best_b)
-           - cfg.w_smooth  * utility_smooth(best_b, prev_brightness);
+    best_u = g_util_cfg.w_comfort * utilityComfort(best_b, ml_prediction)
+           - g_util_cfg.w_energy  * utilityEnergy(best_b)
+           - g_util_cfg.w_smooth  * utilitySmooth(best_b, prev_brightness);
   }
 
   if (out) {
-    out->recommended     = best_b;
+    out->valid           = true;
     out->ml_anchor       = ml_prediction;
     out->prev_brightness = prev_brightness;
-    out->comfort_raw     = utility_comfort(best_b, ml_prediction);
-    out->energy_raw      = utility_energy(best_b);
-    out->smooth_raw      = utility_smooth(best_b, prev_brightness);
-    out->comfort_term    = cfg.w_comfort * out->comfort_raw;
-    out->energy_term     = cfg.w_energy  * out->energy_raw;
-    out->smooth_term     = cfg.w_smooth  * out->smooth_raw;
-    out->utility         = best_u;
-    out->is_night        = is_night;
+    out->ambient         = ambient;
     out->motion          = motion;
+    out->hour            = hour;
+    out->is_night        = is_night;
+    out->recommended     = best_b;
+    out->comfort_raw     = utilityComfort(best_b, ml_prediction);
+    out->energy_raw      = utilityEnergy(best_b);
+    out->smooth_raw      = utilitySmooth(best_b, prev_brightness);
+    out->comfort_term    = g_util_cfg.w_comfort * out->comfort_raw;
+    out->energy_term     = g_util_cfg.w_energy  * out->energy_raw;
+    out->smooth_term     = g_util_cfg.w_smooth  * out->smooth_raw;
+    out->utility         = best_u;
     out->floor_active    = floor_active;
-    out->floor_value     = floor_value;
     out->floor_binding   = floor_active && (best_b_unc < floor_value);
+    out->floor_value     = g_util_cfg.min_safe_night;
   }
 
   return best_b;
 }
+
+// ---------------------------------------------------------------------------
+// utilityAgentPrint()  -  human-readable breakdown of the last evaluation.
+// Lives in the header (Arduino build); a no-op stub keeps host builds happy.
+// ---------------------------------------------------------------------------
+#if defined(ARDUINO)
+static inline void utilityAgentPrint(const UtilityResult &r) {
+  Serial.println();
+  Serial.println(F("=== UTILITY-BASED AGENT (non-ML AI layer) ==="));
+
+  Serial.println(F("--- Weights (RAM only) ---"));
+  Serial.print(F("  w_comfort     : ")); Serial.println(g_util_cfg.w_comfort, 3);
+  Serial.print(F("  w_energy      : ")); Serial.println(g_util_cfg.w_energy, 3);
+  Serial.print(F("  w_smooth      : ")); Serial.println(g_util_cfg.w_smooth, 3);
+  Serial.print(F("  min_safe_night: ")); Serial.print(g_util_cfg.min_safe_night); Serial.println(F("%"));
+
+  if (!r.valid) {
+    Serial.println(F("--- No evaluation yet (waiting for first loop cycle) ---"));
+    Serial.println();
+    return;
+  }
+
+  Serial.println(F("--- Inputs (last cycle) ---"));
+  Serial.print(F("  Hour          : ")); Serial.println(r.hour);
+  Serial.print(F("  Ambient (lux) : ")); Serial.println(r.ambient, 1);
+  Serial.print(F("  Motion        : ")); Serial.println(r.motion ? F("YES") : F("NO"));
+  Serial.print(F("  Night (20-04) : ")); Serial.println(r.is_night ? F("YES") : F("NO"));
+  Serial.print(F("  ML anchor     : ")); Serial.print(r.ml_anchor, 1); Serial.println(F("%"));
+  Serial.print(F("  Prev bright.  : ")); Serial.print(r.prev_brightness, 1); Serial.println(F("%"));
+
+  Serial.println(F("--- Safety floor ---"));
+  if (!r.floor_active) {
+    Serial.println(F("  Status        : not applicable (not night+motion)"));
+  } else if (r.floor_binding) {
+    Serial.print  (F("  Status        : ENFORCED - raised choice to >= "));
+    Serial.print(r.floor_value); Serial.println(F("%"));
+  } else {
+    Serial.print  (F("  Status        : active, not binding (choice already >= "));
+    Serial.print(r.floor_value); Serial.println(F("%)"));
+  }
+
+  Serial.println(F("--- Per-term contributions at recommended b ---"));
+  Serial.print(F("  +comfort      : +")); Serial.print(r.comfort_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(r.comfort_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  -energy       : -")); Serial.print(r.energy_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(r.energy_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  -smooth       : -")); Serial.print(r.smooth_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(r.smooth_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  = utility U   : ")); Serial.println(r.utility, 4);
+
+  Serial.println(F("--- Decision ---"));
+  Serial.print(F("  ML anchor     : ")); Serial.print(r.ml_anchor, 1);  Serial.println(F("%"));
+  Serial.print(F("  Recommended   : ")); Serial.print(r.recommended, 1); Serial.println(F("%"));
+  Serial.print(F("  Delta vs ML   : ")); Serial.print(r.recommended - r.ml_anchor, 1); Serial.println(F("%"));
+  Serial.println();
+}
+#else
+static inline void utilityAgentPrint(const UtilityResult &) {}
+#endif
 
 #endif  // UTILITY_AGENT_H
