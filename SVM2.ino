@@ -59,6 +59,7 @@
 #include <EEPROM.h>
 #include <math.h>
 #include "svm_model.h"
+#include "utility_agent.h"   // NON-ML AI layer (advisory utility-based agent)
 
 // ============================================
 // PIN DEFINITIONS
@@ -186,6 +187,21 @@ unsigned long prediction_count = 0;
 float avg_brightness           = 0;
 
 // ============================================
+// UTILITY-BASED AGENT (NON-ML AI LAYER)
+// Advisory by default: the agent only RECOMMENDS a brightness. It drives the
+// LED only when util_apply == true ("utilon"). Config lives in RAM only - it
+// does NOT touch the EEPROM layout or the SVM+KNN prediction pipeline.
+// ============================================
+
+bool          util_apply = false;                 // false => behaves exactly as before
+UtilityConfig util_cfg;                            // weights + night floor (set in setup)
+UtilityResult util_last;                           // last evaluation (for `utility` cmd)
+bool          util_last_valid    = false;          // has loop() run an evaluation yet?
+float         util_last_ambient  = 0.0f;           // snapshot of inputs at last eval
+int           util_last_hour     = 0;
+int           util_last_motion   = 0;
+
+// ============================================
 // FORWARD DECLARATIONS
 // ============================================
 
@@ -199,6 +215,7 @@ int   readManualOffset();
 int   getTimePeriod(int hour);
 void  printDateTime(DateTime dt);
 void  handleSerialCommand();
+void  cmdUtility();
 void  monitorPotForSampleCapture(unsigned long current_time, float ml_pred, float user_brightness);
 void  checkDailyRollover(DateTime &now);
 static inline void sampleSvmFeatures(const TrainingSample &s,
@@ -593,6 +610,10 @@ void setup() {
   loadKnnConfig();
   initializeTrainingStorage();
 
+  // Utility-based agent config lives in RAM only (no EEPROM). Defaults:
+  // w_comfort=1.0, w_energy=0.3, w_smooth=0.5, night-motion floor=40%.
+  util_cfg = utility_default_config();
+
   smoothed_ldr = readLDR();
 
   Serial.println(F("=== MODEL ==="));
@@ -607,10 +628,12 @@ void setup() {
   Serial.print  (SVM_N_SV);
   Serial.println(F(" support vectors, frozen)"));
   Serial.println(F("Personalize: KNN, gated by same day-of-week + minute window"));
+  Serial.println(F("AI layer    : Utility-based agent (ADVISORY - off by default)"));
 
   Serial.println(F("=== Commands ==="));
   Serial.println(F("help, stats, samples, clearsamples, modelinfo, knninfo, resetmodel"));
   Serial.println(F("setk N | setsigma X | setwindow N"));
+  Serial.println(F("utility | utilon | utiloff | setutil C E M [F]"));
   Serial.println(F("addsample HH [MM] DD AMBIENT MOTION BRIGHTNESS"));
   Serial.println(F("test      HH [MM] DD AMBIENT MOTION POT"));
 
@@ -651,7 +674,24 @@ void loop() {
 
     manual_offset = readManualOffset();
 
-    float final_brightness = ml_brightness + manual_offset;
+    // --- Utility-based agent (READ-ONLY) ---------------------------------
+    // Reads the ML brightness as the comfort anchor and the current sensor/
+    // clock inputs. prev_brightness = smoothed_brightness (still holds the
+    // previous cycle's value here). Night = 20:00..04:00. This call mutates
+    // nothing in the prediction pipeline; it only fills util_last.
+    bool  util_is_night = (hour >= 20 || hour < 4);
+    float util_reco = utility_evaluate(util_cfg, ml_brightness, smoothed_brightness,
+                                       util_is_night, motion_detected != 0, &util_last);
+    util_last_valid   = true;
+    util_last_ambient = smoothed_ldr;
+    util_last_hour    = hour;
+    util_last_motion  = motion_detected;
+
+    // Compose final brightness. When the agent is advisory (util_apply==false)
+    // this is byte-identical to the original behaviour; when enabled, the
+    // agent's recommendation replaces the ML value as the base.
+    float base_brightness  = util_apply ? util_reco : ml_brightness;
+    float final_brightness = base_brightness + manual_offset;
     if (final_brightness < 0)   final_brightness = 0;
     if (final_brightness > 100) final_brightness = 100;
 
@@ -978,6 +1018,62 @@ void cmdStats() {
   Serial.println();
 }
 
+void cmdUtility() {
+  Serial.println();
+  Serial.println(F("=== UTILITY-BASED AGENT ==="));
+  Serial.print  (F("Mode            : "));
+  Serial.println(util_apply ? F("ACTIVE (driving LED)") : F("ADVISORY (off - LED unchanged)"));
+
+  Serial.println(F("--- Weights ---"));
+  Serial.print(F("  w_comfort     : ")); Serial.println(util_cfg.w_comfort, 3);
+  Serial.print(F("  w_energy      : ")); Serial.println(util_cfg.w_energy, 3);
+  Serial.print(F("  w_smooth      : ")); Serial.println(util_cfg.w_smooth, 3);
+  Serial.print(F("  min_safe_night: ")); Serial.print(util_cfg.min_safe_night, 1); Serial.println(F("%"));
+
+  if (!util_last_valid) {
+    Serial.println(F("--- No evaluation yet (waiting for first loop cycle) ---"));
+    Serial.println();
+    return;
+  }
+
+  Serial.println(F("--- Inputs (last cycle) ---"));
+  Serial.print(F("  Hour          : ")); Serial.println(util_last_hour);
+  Serial.print(F("  Ambient (lux) : ")); Serial.println(util_last_ambient, 1);
+  Serial.print(F("  Motion        : ")); Serial.println(util_last_motion ? F("YES") : F("NO"));
+  Serial.print(F("  Night (20-04) : ")); Serial.println(util_last.is_night ? F("YES") : F("NO"));
+  Serial.print(F("  ML anchor     : ")); Serial.print(util_last.ml_anchor, 1); Serial.println(F("%"));
+  Serial.print(F("  Prev bright.  : ")); Serial.print(util_last.prev_brightness, 1); Serial.println(F("%"));
+
+  Serial.println(F("--- Safety floor ---"));
+  if (!util_last.floor_active) {
+    Serial.println(F("  Status        : not applicable (not night+motion)"));
+  } else if (util_last.floor_binding) {
+    Serial.print  (F("  Status        : ENFORCED - raised choice to >= "));
+    Serial.print(util_last.floor_value, 1); Serial.println(F("%"));
+  } else {
+    Serial.print  (F("  Status        : active, not binding (choice already >= "));
+    Serial.print(util_last.floor_value, 1); Serial.println(F("%)"));
+  }
+
+  Serial.println(F("--- Per-term contributions at recommended b ---"));
+  Serial.print(F("  +comfort      : +")); Serial.print(util_last.comfort_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(util_last.comfort_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  -energy       : -")); Serial.print(util_last.energy_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(util_last.energy_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  -smooth       : -")); Serial.print(util_last.smooth_term, 4);
+  Serial.print(F("  (raw "));            Serial.print(util_last.smooth_raw, 4); Serial.println(F(")"));
+  Serial.print(F("  = utility U   : ")); Serial.println(util_last.utility, 4);
+
+  Serial.println(F("--- Decision ---"));
+  Serial.print(F("  ML anchor     : ")); Serial.print(util_last.ml_anchor, 1);  Serial.println(F("%"));
+  Serial.print(F("  Recommended   : ")); Serial.print(util_last.recommended, 1); Serial.println(F("%"));
+  Serial.print(F("  Delta vs ML   : ")); Serial.print(util_last.recommended - util_last.ml_anchor, 1); Serial.println(F("%"));
+  Serial.print(F("  Applied?      : "));
+  Serial.println(util_apply ? F("YES (this value drives the LED)")
+                            : F("NO  (advisory only - type 'utilon' to apply)"));
+  Serial.println();
+}
+
 void cmdHelp() {
   Serial.println();
   Serial.println(F("=== COMMANDS ==="));
@@ -991,6 +1087,12 @@ void cmdHelp() {
   Serial.println(F("setk N          - K neighbors (1..MAX)"));
   Serial.println(F("setsigma X      - kernel bandwidth (>0)"));
   Serial.println(F("setwindow N     - time window in minutes (1..720)"));
+  Serial.println(F(""));
+  Serial.println(F("utility         - utility-agent breakdown (inputs/weights/terms)"));
+  Serial.println(F("utilon          - let the agent DRIVE brightness"));
+  Serial.println(F("utiloff         - advisory only (LED behaves as before)"));
+  Serial.println(F("setutil C E M [F] - weights comfort/energy/smooth (>=0)"));
+  Serial.println(F("                  optional F = night-motion floor% (0..100)"));
   Serial.println(F(""));
   Serial.println(F("addsample HH DD AMBIENT MOTION BRIGHTNESS"));
   Serial.println(F("                  HH=0..23, DD=0(Mon)..6(Sun)"));
@@ -1166,6 +1268,66 @@ void handleSerialCommand() {
     if (pot < 0 || pot > 4095)     { Serial.print(F("[x] Pot 0..4095, got "));       Serial.println(pot); return; }
 
     testManualPrediction(hh, mm, dd, amb, mot, pot);
+  }
+  else if (command == "utility") {
+    cmdUtility();
+  }
+  else if (command == "utilon") {
+    util_apply = true;
+    Serial.println();
+    Serial.println(F("[v] Utility agent ENABLED - it now drives brightness."));
+    Serial.println(F("    (SVM+KNN prediction unchanged; agent uses it as the comfort anchor)"));
+    Serial.println(F("    Type 'utiloff' to revert to advisory-only."));
+    Serial.println();
+  }
+  else if (command == "utiloff") {
+    util_apply = false;
+    Serial.println();
+    Serial.println(F("[v] Utility agent set to ADVISORY - LED behaves exactly as before."));
+    Serial.println(F("    The agent still computes a recommendation ('utility' to view)."));
+    Serial.println();
+  }
+  else if (command.startsWith("setutil ")) {
+    String args = command.substring(8);
+    args.trim();
+
+    String tok[5];
+    int n = tokenizeArgs(args, tok, 5);
+
+    if (n != 3 && n != 4) {
+      Serial.print(F("[x] Expected 3 or 4 numeric arguments after 'setutil', got "));
+      Serial.println(n);
+      Serial.println(F("    setutil C E M       (comfort energy smooth weights)"));
+      Serial.println(F("    setutil C E M F     (+ night-motion floor%)"));
+      return;
+    }
+
+    float c = tok[0].toFloat();
+    float e = tok[1].toFloat();
+    float m = tok[2].toFloat();
+    float f = (n == 4) ? tok[3].toFloat() : util_cfg.min_safe_night;
+
+    if (c < 0 || e < 0 || m < 0) {
+      Serial.println(F("[x] Weights must be >= 0"));
+      return;
+    }
+    if (f < 0 || f > 100) {
+      Serial.print(F("[x] Floor must be 0..100, got ")); Serial.println(f);
+      return;
+    }
+
+    util_cfg.w_comfort      = c;
+    util_cfg.w_energy       = e;
+    util_cfg.w_smooth       = m;
+    util_cfg.min_safe_night = f;
+
+    Serial.println();
+    Serial.println(F("[v] Utility weights updated (RAM only):"));
+    Serial.print(F("    w_comfort=")); Serial.print(c, 3);
+    Serial.print(F(" w_energy="));     Serial.print(e, 3);
+    Serial.print(F(" w_smooth="));     Serial.print(m, 3);
+    Serial.print(F(" floor="));        Serial.print(f, 1); Serial.println(F("%"));
+    Serial.println();
   }
   else if (command.length() > 0) {
     Serial.print(F("[x] Unknown: ")); Serial.println(command);
